@@ -1,0 +1,253 @@
+# * Reusable workflow to build Docker image and publish it to JFrog SaaS
+name: Docker.Build.Publish
+on:
+  workflow_call:
+    inputs:
+      dockerfile_path:
+        required: false
+        default: "Dockerfile"
+        type: string
+        description: |
+          Path to Dockerfile.
+          Must be relative to repository root directory.
+      docker_source_path:
+        required: false
+        default: "."
+        type: string
+        description: |
+          Path to source files for Docker image to be build.
+          Must be relative to repository root directory.
+      image_name:
+        required: false
+        default: ${{ github.event.repository.name }}
+        type: string
+        description: Docker image name.
+      publish_latest_tag:
+        required: false
+        type: boolean
+        default: true
+        description: Whether to create & push 'latest' tag of docker image
+      skip_workflow:
+        required: false
+        type: boolean
+        default: false
+        description: Whether workflow execution steps should be skipped.
+      run_docker_publish:
+        required: false
+        type: boolean
+        default: true
+        description: Whether docker image should be pushed to artifactory.
+      image_subdirectory:
+        required: false
+        default: "miscellaneous"
+        type: string
+        description: Directory in which image is located. Allows for grouping associated components under single directory in JFrog repository.
+      image_tag:
+        required: false
+        default: ""
+        type: string
+        description: Docker image tag.
+      major_version_number:
+        required: false
+        default: 1
+        type: number
+        description: Major version number.
+      minor_version_number:
+        required: false
+        default: 0
+        type: number
+        description: Minor version number.
+      jf_project_key:
+        required: false
+        type: string
+        default: "platform"
+        description: JFrog SaaS project key.
+      jf_username:
+        required: true
+        type: string
+        description: JFrog SaaS username. Used to authenticate with Jfrog Artifactory.
+      jf_cli_version:
+        required: false
+        default: latest
+        type: string
+        description: Jfrog cli version.
+      jf_docker_push_repo:
+        required: false
+        default: ${{ vars.JF_DOCKER_REPOSITORY_NAME }}
+        type: string
+        description: The jfrog repository for docker pushes; defaults to 'platform-docker-local'.
+      docker_build_args:
+        required: false
+        type: string
+        description: Additional docker vars.
+      buildkit_enabled:
+        required: false
+        type: boolean
+        default: true
+        description: Switch to disable using buildkit as docker builder
+      gha_cache_enabled:
+        required: false
+        type: boolean
+        default: false
+        description: Switch to disable cache
+      runner_group_name:
+        required: false
+        default: runners-enterprise
+        type: string
+        description: Name of the runner group to run the job on.
+    secrets:
+      jf_reference_token:
+        required: true
+        description: JFrog SaaS reference token
+      docker_build_secret_args:
+        required: false
+        description: Additional secret docker vars.
+      jf_cli_key:
+        required: true
+        description: Jfrog CLI secret key (for SaaS).
+    outputs:
+      image_tag:
+        value: ${{ jobs.build.outputs.image_tag }}
+        description: Docker Tag (example value '1.12.4')
+      image_path:
+        value: ${{ jobs.build.outputs.image_path }}
+        description: Docker path (example value '<aws-ecr>/platform-docker-local/log-ingress/log-ingress-polling-service')
+
+env:
+  JF_ENV_1: ${{ secrets.jf_cli_key }}
+  JF_HOST: "<aws-ecr>"
+  JFROG_CLI_BUILD_PROJECT: ${{ inputs.jf_project_key }}
+  JFROG_CLI_BUILD_NAME: ${{ github.repository }}/${{ inputs.image_name }}
+  DOCKER_IMAGE_NAME_SUFFIX: ${{ inputs.image_subdirectory }}/${{ inputs.image_name }}
+jobs:
+  build:
+    if: inputs.skip_workflow == false
+    name: Docker.Build.JFrog.Publish
+    runs-on:
+      group: ${{ inputs.runner_group_name }}
+    outputs:
+      image_tag: ${{ steps.set_image_tag.outputs.image_tag }}
+      image_path: ${{ steps.set_image_tag.outputs.image_path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup JFrog CLI
+        uses: jfrog/setup-jfrog-cli@v4
+        with:
+          version: ${{ inputs.jf_cli_version }}
+      - name: Login to Jfrog Artifactory
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.JF_HOST }}
+          username: ${{ inputs.jf_username }}
+          password: ${{ secrets.jf_reference_token }}
+      - name: Check connectivity with Artifactory
+        run: jf -v && jf c s && jf rt ping
+      - name: Set image name
+        id: set_image_tag
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            export IMAGE_TAG=$(echo "${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}" | sed -e 's/\//-/g')
+            export IMAGE_PATH="${JF_HOST}/${{ inputs.jf_docker_push_repo }}/${DOCKER_IMAGE_NAME_SUFFIX}"
+            export JFROG_CLI_BUILD_NUMBER="${{ inputs.major_version_number }}.${{ inputs.minor_version_number }}.${{ github.run_number }}"
+          else
+            # Image tag is provided, use that instead of GITHUB_REF_NAME & GITHUB_RUN_NUMBER
+            export IMAGE_TAG=${{ inputs.image_tag }}
+            export IMAGE_PATH="${JF_HOST}/${{ inputs.jf_docker_push_repo }}/${DOCKER_IMAGE_NAME_SUFFIX}"
+            export JFROG_CLI_BUILD_NUMBER="$IMAGE_TAG"
+          fi
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_path=$IMAGE_PATH" >> "$GITHUB_OUTPUT"
+          echo "jf_cli_build_number=$JFROG_CLI_BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Connect to remote Docker Builder
+        if: inputs.buildkit_enabled == true
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: ${{ vars.BUILDKIT_URL }}
+        env:
+          DOCKER_BUILDKIT: 1
+      - name: Create docker secrets file for buildkit # Transfers secrets into file for secure transfer to build processes below
+        run: |
+          $(cat > secrets.txt << 'EOF'
+          JF_USERNAME=${{ inputs.jf_username }}
+          JF_REFERENCE_TOKEN=${{ secrets.jf_reference_token }}
+          JF_CLI_KEY=${{ secrets.jf_cli_key }}
+          ${{ secrets.docker_build_secret_args }}
+          EOF
+          )
+        shell: bash
+      - name: Build and tag docker image (buildkit)
+        if: inputs.buildkit_enabled == true
+        uses: docker/build-push-action@v6
+        id: build-image-remote
+        with:
+          context: ${{ inputs.docker_source_path }}
+          push: false
+          file: ${{ inputs.dockerfile_path }}
+          load: true
+          cache-from: ${{ inputs.gha_cache_enabled && 'type=gha' || '' }}
+          cache-to: ${{ inputs.gha_cache_enabled && 'type=gha,mode=min' || '' }}
+          tags: |
+            ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }}
+            ${{ steps.set_image_tag.outputs.image_path }}:latest
+          build-args: | # Only non-sensitive build args
+            ${{ inputs.docker_build_args }}
+          secret-files: | # Mount secrets file
+            "buildx_secrets=./secrets.txt"
+        env:
+          JFROG_CLI_BUILD_NUMBER: ${{ steps.set_image_tag.outputs.jf_cli_build_number }}
+          DOCKER_BUILDKIT: 1
+      - name: Build and tag docker image (local)
+        if: inputs.buildkit_enabled == false
+        env:
+          JFROG_CLI_BUILD_NUMBER: ${{ steps.set_image_tag.outputs.jf_cli_build_number }}
+        id: build-image-local
+        run: |
+          docker image build \
+          -t ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }} \
+          -t ${{ steps.set_image_tag.outputs.image_path }}:latest \
+          --secret id=buildx_secrets,src=./secrets.txt \
+          $(echo "${{ inputs.docker_build_args }}" | sed -nE 's/^(.+)$/--build-arg \1/p' | tr '\n' ' ') \
+          -f ${{ inputs.dockerfile_path }} ${{ inputs.docker_source_path }}
+      - name: Upload docker image to Artifactory
+        if: inputs.run_docker_publish == true
+        env:
+          JFROG_CLI_BUILD_NUMBER: ${{ steps.set_image_tag.outputs.jf_cli_build_number }}
+        run: |
+          jf docker image push ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }}
+      - name: Upload docker latest image to Artifactory
+        if: inputs.run_docker_publish == true && inputs.publish_latest_tag
+        env:
+          JFROG_CLI_BUILD_NUMBER: ${{ steps.set_image_tag.outputs.jf_cli_build_number }}
+        run: |
+          jf docker image push ${{ steps.set_image_tag.outputs.image_path }}:latest
+      - name: Collect build info
+        if: always()
+        run: |
+          jf rt bag
+          jf rt bce
+      - name: GitHub context summary
+        continue-on-error: true
+        shell: bash
+        run: |
+            echo "Runner: ${{ runner.name }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Actor: [@${{ github.actor }}](${{ github.server_url }}/${{ github.actor }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "Triggering actor: [@${{ github.triggering_actor }}](${{ github.server_url	}}/${{ github.triggering_actor }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch name: ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Runner workspace: ${{ github.workspace }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run ID: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run number: ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run attempt: ${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Workflow name: ${{ github.workflow }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Additional context summary
+        if: inputs.run_docker_publish == true
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Skip workflow: ${{ inputs.skip_workflow }}"  >> "$GITHUB_STEP_SUMMARY"
+          echo "Dockerfile path:  ${{ inputs.dockerfile_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker source path: ${{ inputs.docker_source_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image name: ${{ steps.set_image_tag.outputs.image_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: ${{ steps.set_image_tag.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
