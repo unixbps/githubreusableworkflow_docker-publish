@@ -1,0 +1,209 @@
+# * Reusable workflow to build Docker image and publish it to JFrog SaaS
+name: Docker.Build.Publish
+on:
+  workflow_call:
+    inputs:
+      dockerfile_path:
+        required: false
+        default: "Dockerfile"
+        type: string
+        description: |
+          Path to Dockerfile.
+          Must be relative to repository root directory.
+      docker_source_path:
+        required: false
+        default: "."
+        type: string
+        description: |
+          Path to source files for Docker image to be build.
+          Must be relative to repository root directory.
+      image_name:
+        required: false
+        default: ${{ github.event.repository.name }}
+        type: string
+        description: Docker image name.
+      publish_latest_tag:
+        required: false
+        type: boolean
+        default: true
+        description: Whether to create & push 'latest' tag of docker image
+      skip_workflow:
+        required: false
+        type: boolean
+        default: false
+        description: Whether workflow execution steps should be skipped.
+      run_docker_publish:
+        required: false
+        type: boolean
+        default: true
+        description: Whether docker image should be pushed to artifactory.
+      image_subdirectory:
+        required: false
+        default: "miscellaneous"
+        type: string
+        description: Directory in which image is located. Allows for grouping associated components under single directory in JFrog repository.
+      image_tag:
+        required: false
+        default: ""
+        type: string
+        description: Docker image tag.
+      major_version_number:
+        required: false
+        default: 1
+        type: number
+        description: Major version number.
+      minor_version_number:
+        required: false
+        default: 0
+        type: number
+        description: Minor version number.
+      aws_region:
+        required: true
+        type: string
+        description: AWS region for ECR.
+      ecr_repository:
+        required: true
+        type: string
+        description: AWS ECR repository URI (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo)
+      docker_build_args:
+        required: false
+        type: string
+        description: Additional docker vars.
+      buildkit_enabled:
+        required: false
+        type: boolean
+        default: true
+        description: Switch to disable using buildkit as docker builder
+      gha_cache_enabled:
+        required: false
+        type: boolean
+        default: false
+        description: Switch to disable cache
+      runner_group_name:
+        required: false
+        default: runners-enterprise
+        type: string
+        description: Name of the runner group to run the job on.
+    secrets:
+      aws_access_key_id:
+        required: true
+        description: AWS Access Key ID for ECR login
+      aws_secret_access_key:
+        required: true
+        description: AWS Secret Access Key for ECR login
+      docker_build_secret_args:
+        required: false
+        description: Additional secret docker vars.
+    outputs:
+      image_tag:
+        value: ${{ jobs.build.outputs.image_tag }}
+        description: Docker Tag (example value '1.12.4')
+      image_path:
+        value: ${{ jobs.build.outputs.image_path }}
+        description: Docker path (example value '<aws-ecr>/platform-docker-local/log-ingress/log-ingress-polling-service')
+
+env:
+  AWS_REGION: ${{ inputs.aws_region }}
+jobs:
+  build:
+    if: inputs.skip_workflow == false
+    name: Docker.Build.AWS.ECR.Publish
+    runs-on:
+      group: ${{ inputs.runner_group_name }}
+    outputs:
+      image_tag: ${{ steps.set_image_tag.outputs.image_tag }}
+      image_path: ${{ steps.set_image_tag.outputs.image_path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.aws_access_key_id }}
+          aws-secret-access-key: ${{ secrets.aws_secret_access_key }}
+          aws-region: ${{ inputs.aws_region }}
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Set image name
+        id: set_image_tag
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            IMAGE_TAG=$(echo "${GITHUB_REF_NAME}-${GITHUB_RUN_NUMBER}" | sed -e 's/\//-/g')
+          else
+            IMAGE_TAG=${{ inputs.image_tag }}
+          fi
+          IMAGE_PATH="${{ inputs.ecr_repository }}"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_path=$IMAGE_PATH" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Connect to remote Docker Builder
+        if: inputs.buildkit_enabled == true
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: ${{ vars.BUILDKIT_URL }}
+        env:
+          DOCKER_BUILDKIT: 1
+      - name: Create docker secrets file for buildkit # Transfers secrets into file for secure transfer to build processes below
+        run: |
+          $(cat > secrets.txt << 'EOF'
+          ${{ secrets.docker_build_secret_args }}
+          EOF
+          )
+        shell: bash
+      - name: Build and tag docker image (buildkit)
+        if: inputs.buildkit_enabled == true
+        uses: docker/build-push-action@v6
+        id: build-image-remote
+        with:
+          context: ${{ inputs.docker_source_path }}
+          push: true
+          file: ${{ inputs.dockerfile_path }}
+          cache-from: ${{ inputs.gha_cache_enabled && 'type=gha' || '' }}
+          cache-to: ${{ inputs.gha_cache_enabled && 'type=gha,mode=min' || '' }}
+          tags: |
+            ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }}
+            ${{ steps.set_image_tag.outputs.image_path }}:latest
+          build-args: | # Only non-sensitive build args
+            ${{ inputs.docker_build_args }}
+          secret-files: | # Mount secrets file
+            "buildx_secrets=./secrets.txt"
+        env:
+          DOCKER_BUILDKIT: 1
+      - name: Build and tag docker image (local)
+        if: inputs.buildkit_enabled == false
+        id: build-image-local
+        run: |
+          docker image build \
+          -t ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }} \
+          -t ${{ steps.set_image_tag.outputs.image_path }}:latest \
+          --secret id=buildx_secrets,src=./secrets.txt \
+          $(echo "${{ inputs.docker_build_args }}" | sed -nE 's/^(.+)$/--build-arg \1/p' | tr '\n' ' ') \
+          -f ${{ inputs.dockerfile_path }} ${{ inputs.docker_source_path }}
+          docker push ${{ steps.set_image_tag.outputs.image_path }}:${{ steps.set_image_tag.outputs.image_tag }}
+          docker push ${{ steps.set_image_tag.outputs.image_path }}:latest
+      # Images are pushed to ECR in the build steps above
+      - name: GitHub context summary
+        continue-on-error: true
+        shell: bash
+        run: |
+            echo "Runner: ${{ runner.name }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Actor: [@${{ github.actor }}](${{ github.server_url }}/${{ github.actor }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "Triggering actor: [@${{ github.triggering_actor }}](${{ github.server_url	}}/${{ github.triggering_actor }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "Branch name: ${{ github.ref_name }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Runner workspace: ${{ github.workspace }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run ID: ${{ github.run_id }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run number: ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Run attempt: ${{ github.run_attempt }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "Workflow name: ${{ github.workflow }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Additional context summary
+        if: inputs.run_docker_publish == true
+        continue-on-error: true
+        shell: bash
+        run: |
+          echo "Skip workflow: ${{ inputs.skip_workflow }}"  >> "$GITHUB_STEP_SUMMARY"
+          echo "Dockerfile path:  ${{ inputs.dockerfile_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker source path: ${{ inputs.docker_source_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image name: ${{ steps.set_image_tag.outputs.image_path }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image tag: ${{ steps.set_image_tag.outputs.image_tag }}" >> "$GITHUB_STEP_SUMMARY"
