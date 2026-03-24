@@ -81,7 +81,7 @@ on:
         description: Switch to disable cache
       runner_group_name:
         required: false
-        default: runners-enterprise
+        default: ubuntu-latest
         type: string
         description: Name of the runner group to run the job on.
     secrets:
@@ -108,8 +108,7 @@ jobs:
   build:
     if: inputs.skip_workflow == false
     name: Docker.Build.AWS.ECR.Publish
-    runs-on:
-      group: ${{ inputs.runner_group_name }}
+    runs-on: ${{ inputs.runner_group_name }}
     outputs:
       image_tag: ${{ steps.set_image_tag.outputs.image_tag }}
       image_path: ${{ steps.set_image_tag.outputs.image_path }}
